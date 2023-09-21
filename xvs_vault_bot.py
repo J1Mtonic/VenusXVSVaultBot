@@ -3,14 +3,31 @@ import requests
 import json
 import time
 import schedule
+import logging
 from web3 import Web3, HTTPProvider
 
 path_to_key = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keys.json")
 path_to_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xvs_vault_stakers.json")
+path_to_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xvs_vault_bot.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+handler = logging.FileHandler(path_to_log, encoding="utf-8")
+formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
 contractAddress = '0x051100480289e704d20e9db4804837068f3f9204'
 depositMethodID = '0x0efe6a8b'
 withdrawalMethodID = '0x7ac92456'
-provider_url = "https://bsc-dataseed.binance.org"
+provider_url = "https://bsc-dataseed.binance.org" 
+#provider_url = "https://bsc.meowrpc.com"
 w3 = Web3(HTTPProvider(provider_url))
 contractABI = [
     {
@@ -39,15 +56,33 @@ apiToken = keys["apiToken"]
 TELEGRAM_TOKEN = keys["TELEGRAM_TOKEN"]
 CHAT_ID = keys["CHAT_ID"]
 
+def validate_json_structure(data):
+    if not isinstance(data, dict):
+        raise ValueError("Expected JSON object.")
+    if not any(key in data for key in ["result", "message", "status"]):
+        raise ValueError("JSON does not contain common keys: 'result', 'message', or 'status'.")
+
 def safe_request(url):
     while True:
         try:
             response = requests.get(url)
             response.raise_for_status()
-            return response
-        except requests.RequestException as e:
-            print(f"Error fetching data from {url}. Error: {e}. Retrying in 5 seconds...")
-            time.sleep(5)
+            content_type = response.headers.get('Content-Type', '')
+            if 'application/json' in content_type:
+                json_data = response.json()
+                try:
+                    validate_json_structure(json_data)
+                    return json_data
+                except ValueError as ve:
+                    logger.error(f"Validation error: {ve}. Response content: {json_data}")
+                    raise
+            else:
+                raise ValueError(f"Unexpected content type {content_type} from {url}")
+        except (requests.RequestException, ValueError) as e:
+            error_message = f"Error fetching data from {url}. Error: {e}. Retrying in 60 seconds..."
+            logger.info(error_message)
+            logging.error(error_message)
+            time.sleep(60)
 
 def fetchData():
     global jsonData
@@ -55,7 +90,7 @@ def fetchData():
         with open(path_to_file, "r") as file:
             jsonData = json.load(file)
     except Exception as e:
-        print(f"Error reading file: {e}")
+        logger.info(f"Error reading file: {e}")
         response = safe_request("https://raw.githubusercontent.com/J1Mtonic/VenusXVSVaultBot/main/xvs_vault_stakers.json")
         jsonData = response.json()
     updateData()
@@ -69,29 +104,32 @@ def getCurrentBlock():
     return w3.eth.block_number
 
 def fetchTransactionsRecursively(startBlock, endBlock, methodID):
-    apiUrl = f"https://api.bscscan.com/api?module=account&action=txlist&address={contractAddress}&startblock={startBlock}&endblock={endBlock}&page=1&offset=10000&sort=asc&apikey={apiToken}"
-    response = safe_request(apiUrl)
-    data = response.json()
-
-    if data["message"] == "Result window is too large":
-        midBlock = (startBlock + endBlock) // 2
-        firstHalf = fetchTransactionsRecursively(startBlock, midBlock)
-        secondHalf = fetchTransactionsRecursively(midBlock + 1, endBlock)
-        return firstHalf + secondHalf
-
-    return [tx for tx in data.get("result", []) if tx["input"].startswith(methodID)]
+    try:
+        apiUrl = f"https://api.bscscan.com/api?module=account&action=txlist&address={contractAddress}&startblock={startBlock}&endblock={endBlock}&page=1&offset=10000&sort=asc&apikey={apiToken}"
+        data = safe_request(apiUrl)
+        if data and data.get("message", "") == "Result window is too large":
+            midBlock = (startBlock + endBlock) // 2
+            firstHalf = fetchTransactionsRecursively(startBlock, midBlock, methodID)
+            secondHalf = fetchTransactionsRecursively(midBlock + 1, endBlock, methodID)
+            return firstHalf + secondHalf
+        return [tx for tx in data.get("result", []) if tx["input"].startswith(methodID)]    
+    except (KeyError, TypeError) as e:
+        error_message = f"Unexpected JSON structure or value. Error: {e}. Retrying..."
+        logger.info(error_message)
+        logging.error(error_message)
+        return []
 
 def updateData():
     global jsonData
-    print("Updating data...")
+    #logger.info("Updating data...")
 
     previousData = jsonData.copy()
 
     currentBlock = getCurrentBlock()
-    print(f"Current block: {currentBlock}")
+    logger.info(f"Current block: {currentBlock}")
 
     lastBlock = jsonData.get("metadata", {}).get("last_block_evaluated", 0)
-    print(f"Last evaluated block: {lastBlock}")
+    #logger.info(f"Last evaluated block: {lastBlock}")
 
     depositTransactions = fetchTransactionsRecursively(lastBlock + 1, currentBlock, depositMethodID)
     withdrawalTransactions = fetchTransactionsRecursively(lastBlock + 1, currentBlock, withdrawalMethodID)
@@ -113,12 +151,12 @@ def updateData():
         if existingUser:
             previousAmount = existingUser["amount"]
             difference = amount - previousAmount
-            print(f"User: {user} Difference: {difference}")
+            logger.info(f"User: {user} Difference: {difference}")
             if amount == 0:
                 jsonData["transactions"] = [item for item in jsonData["transactions"] if item["user"] != user]
             else:
                 existingUser["amount"] = amount
-                print(f"User: {user} updated with new amount: {amount}")
+                logger.info(f"User: {user} updated with new amount: {amount}")
 
             if abs(difference) >= 1000:
                 formatted_difference = format(int(abs(difference)), ',')
@@ -135,7 +173,7 @@ def updateData():
                         send_telegram_message(CHAT_ID, TELEGRAM_TOKEN, f"🚨🐳❗❗ [{truncated_address}]({debank_url}) Withdraw _{formatted_difference} XVS_\n🔒 Staking: _{formatted_amount} XVS_")
         elif amount > 0:
             jsonData["transactions"].append({"user": user, "amount": amount})
-            print(f"User: {user} added with amount: {amount}")
+            logger.info(f"User: {user} added with amount: {amount}")
             formatted_amount = format(int(amount), ',')
             if amount > 30000:
                 send_telegram_message(CHAT_ID, TELEGRAM_TOKEN, f"❇️🐳❗❗ [{truncated_address}]({debank_url}) New Vault User!\n🔒 Staking: _{formatted_amount} XVS_")
@@ -155,9 +193,10 @@ def updateData():
     jsonData["metadata"] = summary
 
     if jsonData["transactions"] != previousData.get("transactions", {}):
-        print("Data updated successfully.")        
+        logger.info("Data updated successfully.")        
     else:
-        print("No new updates found.")
+        #logger.info("No new updates found.")
+        pass
 
     saveData()
 
@@ -196,9 +235,9 @@ def send_telegram_message(chat_id, token, message, parse_mode=None):
         base_url += f"&parse_mode={parse_mode}"
     try:
         response = safe_request(base_url)
-        return response.json()
+        return response
     except Exception as e:
-        print(f"Error sending Telegram message: {e}")
+        logger.info(f"Error sending Telegram message: {e}")
         return None
 
 def daily_tasks():
@@ -206,13 +245,17 @@ def daily_tasks():
     displayUsers()
 
 if __name__ == "__main__":
-    fetchData()
-    schedule.every().day.at("06:00").do(daily_tasks)
-    updateData_counter = 0
-    while True:
-        schedule.run_pending()
-        if updateData_counter >= 10:
-            updateData()
-            updateData_counter = 0
-        time.sleep(1)
-        updateData_counter += 1
+    try:
+        fetchData()
+        schedule.every().day.at("07:30").do(daily_tasks)
+        updateData_counter = 0
+        while True:
+            schedule.run_pending()
+            if updateData_counter >= 10:
+                updateData()
+                updateData_counter = 0
+            time.sleep(1)
+            updateData_counter += 1
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+
